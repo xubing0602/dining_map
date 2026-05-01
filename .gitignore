@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+output/scraper.log
+# working files ARE committed (needed for cross-run resume in CI)
+# only exclude the old-style checkpoint
+output/detail_checkpoint.csv

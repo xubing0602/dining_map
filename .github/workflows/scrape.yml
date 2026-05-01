@@ -1,0 +1,121 @@
+name: Monthly Michelin Scrape
+
+on:
+  # 1st of every month at 03:00 UTC
+  schedule:
+    - cron: '0 3 1 * *'
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Scrape mode'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all       # starred + bib (same as scheduled)
+          - starred
+          - bib
+          - selected  # ~6 hrs — separate job
+          - sample    # quick smoke-test
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # starred + bib  (~5 hrs combined)
+  # ------------------------------------------------------------------
+  scrape-starred-bib:
+    name: Scrape starred + bib
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6-hr hard ceiling
+    if: |
+      github.event_name == 'schedule' ||
+      github.event.inputs.mode == 'all' ||
+      github.event.inputs.mode == 'starred' ||
+      github.event.inputs.mode == 'bib' ||
+      github.event.inputs.mode == 'sample'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Pull any working files left by a previous partial run
+      - name: Pull latest (get any resume state)
+        run: git pull --rebase
+
+      - name: Scrape starred
+        if: |
+          github.event_name == 'schedule' ||
+          github.event.inputs.mode == 'all' ||
+          github.event.inputs.mode == 'starred'
+        # 5 workers → ~2-3 req/s → ~45 min for 4k restaurants
+        # --max-hours 2.5 leaves buffer before the 6-hr job timeout
+        run: python scraper.py --mode starred --workers 5 --max-hours 2.5
+
+      - name: Scrape bib gourmand
+        if: |
+          github.event_name == 'schedule' ||
+          github.event.inputs.mode == 'all' ||
+          github.event.inputs.mode == 'bib'
+        run: python scraper.py --mode bib --workers 5 --max-hours 2.5
+
+      - name: Scrape sample
+        if: github.event.inputs.mode == 'sample'
+        run: python scraper.py --mode sample --workers 3
+
+      # Always commit — saves partial progress if a step hit the time limit
+      - name: Commit results (including any partial working files)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git diff --staged --quiet && echo "Nothing to commit" && exit 0
+          git commit -m "scrape: starred+bib $(date -u +%Y-%m-%d)"
+          git push
+
+  # ------------------------------------------------------------------
+  # selected  (~6 hrs — manual only, separate job)
+  # ------------------------------------------------------------------
+  scrape-selected:
+    name: Scrape selected
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: github.event.inputs.mode == 'selected'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull latest (get any resume state)
+        run: git pull --rebase
+
+      - name: Scrape selected
+        run: python scraper.py --mode selected --workers 5 --max-hours 5.5
+
+      - name: Commit results (including any partial working files)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git diff --staged --quiet && echo "Nothing to commit" && exit 0
+          git commit -m "scrape: selected $(date -u +%Y-%m-%d)"
+          git push
