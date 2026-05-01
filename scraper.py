@@ -20,6 +20,7 @@ URLs and continues from where it left off.
 """
 
 import csv
+import itertools
 import re
 import json
 import time
@@ -39,8 +40,27 @@ import pandas as pd
 # Config
 # ---------------------------------------------------------------------------
 BASE_URL = "https://guide.michelin.com"
-LIST_URL = "https://guide.michelin.com/us/en/restaurants"
-LIST_URL_PAGE = "https://guide.michelin.com/us/en/restaurants/page/{page}"
+
+# Per-mode list page configuration
+# base_url = page 1;  page_url = page N (N >= 2)
+# Pagination stops automatically when a page returns zero cards — no page count needed.
+MODE_LIST_CONFIG = {
+    "starred": {
+        "base_url": "https://guide.michelin.com/us/en/restaurants/all-starred",
+        "page_url": "https://guide.michelin.com/us/en/restaurants/all-starred/page/{page}",
+        "filter":   None,         # dedicated URL — all cards are already starred
+    },
+    "bib": {
+        "base_url": "https://guide.michelin.com/us/en/restaurants/bib-gourmand",
+        "page_url": "https://guide.michelin.com/us/en/restaurants/bib-gourmand/page/{page}",
+        "filter":   None,         # dedicated URL — all cards are already Bib Gourmand
+    },
+    "selected": {
+        "base_url": "https://guide.michelin.com/us/en/restaurants",
+        "page_url": "https://guide.michelin.com/us/en/restaurants/page/{page}",
+        "filter":   {"Selected"}, # mixed main list — keep only Selected
+    },
+}
 
 HEADERS = {
     "User-Agent": (
@@ -124,16 +144,35 @@ MODE_PREFIX = {
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
+# Sentinel returned by fetch() when the server says the page does not exist.
+# Callers that paginate should break on this; callers that fetch detail pages
+# should treat it the same as None (skip the restaurant).
+PAGE_NOT_FOUND = object()
+
 
 def fetch(url: str, retries: int = 3) -> str | None:
+    """
+    Returns:
+        str            — HTML body on success
+        PAGE_NOT_FOUND — server returned 404 (page does not exist, do not retry)
+        None           — all other failures after retries
+    """
     for attempt in range(retries):
         try:
             resp = SESSION.get(url, timeout=20)
             if resp.status_code == 200:
                 return resp.text
+            if resp.status_code == 404:
+                log.warning(f"HTTP 404 for {url}")
+                return PAGE_NOT_FOUND  # don't retry; caller decides whether to stop
             if resp.status_code == 429:
                 wait = 30 + attempt * 30
-                log.warning(f"Rate limited. Waiting {wait}s…")
+                log.warning(f"Rate limited (429). Waiting {wait}s…")
+                time.sleep(wait)
+            elif resp.status_code == 202:
+                # Server accepted the request but hasn't finished — transient under load
+                wait = 10 + attempt * 10
+                log.warning(f"HTTP 202 (server busy). Waiting {wait}s and retrying…")
                 time.sleep(wait)
             else:
                 log.warning(f"HTTP {resp.status_code} for {url}")
@@ -153,7 +192,16 @@ def polite_sleep():
 # ---------------------------------------------------------------------------
 def parse_list_page(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
-    cards = soup.find_all("div", attrs={"data-view": "restaurant"})
+    all_cards = soup.find_all("div", attrs={"data-view": "restaurant"})
+    # Exclude placeholder ghost cards Michelin injects to fill the last grid row.
+    # Real cards live in js-restaurant__list_items; ghosts live in js-restaurants__empty_items.
+    cards = [
+        c for c in all_cards
+        if not any(
+            "js-restaurants__empty_items" in " ".join(p.get("class", []))
+            for p in c.parents
+        )
+    ]
     restaurants = []
 
     for card in cards:
@@ -333,20 +381,40 @@ def parse_detail_page(html: str, url: str) -> dict:
 # ---------------------------------------------------------------------------
 # Resumable list-page scraper
 # ---------------------------------------------------------------------------
-def scrape_list_pages(page_range: range) -> list[dict]:
+def scrape_list_pages(cfg: dict, page_range: range | None = None) -> list[dict]:
+    """
+    Walk paginated list pages defined by cfg (one of MODE_LIST_CONFIG values).
+
+    Termination — whichever comes first:
+      - A page returns zero cards  (natural end of the list)
+      - page_range is exhausted    (only when --pages is passed explicitly for testing)
+
+    Applies cfg['filter'] distinction set when set, otherwise keeps all cards.
+    """
+    pages = page_range if page_range is not None else itertools.count(1)
     all_restaurants = []
-    for page in page_range:
-        url = LIST_URL if page == 1 else LIST_URL_PAGE.format(page=page)
+
+    for page in pages:
+        url = cfg["base_url"] if page == 1 else cfg["page_url"].format(page=page)
         log.info(f"List page {page}: {url}")
         html = fetch(url)
+        if html is PAGE_NOT_FOUND:
+            log.info(f"  Page {page} does not exist — end of list")
+            break
         if not html:
-            log.error(f"Failed list page {page}")
+            log.error(f"  Failed — skipping page {page}")
             polite_sleep()
             continue
         items = parse_list_page(html)
+        if not items:
+            log.info(f"  No cards on page {page} — end of list")
+            break
+        if cfg["filter"]:
+            items = [r for r in items if r.get("distinction") in cfg["filter"]]
         log.info(f"  → {len(items)} restaurants")
         all_restaurants.extend(items)
         polite_sleep()
+
     return all_restaurants
 
 
@@ -404,7 +472,7 @@ def scrape_detail_pages(
             return None
         html = fetch(url)
         polite_sleep()         # each worker paces itself independently
-        if not html:
+        if not html:           # covers both PAGE_NOT_FOUND and other failures
             log.warning(f"  Skipped (fetch failed): {url}")
             return None
         return parse_detail_page(html, url)
@@ -451,7 +519,7 @@ def scrape_detail_pages(
 # ---------------------------------------------------------------------------
 # Run modes
 # ---------------------------------------------------------------------------
-def run_mode(mode: str, page_range: range, max_hours: float | None, workers: int = 5) -> None:
+def run_mode(mode: str, page_range: range | None, max_hours: float | None, workers: int = 5) -> None:
     date_str = datetime.now().strftime("%Y%m%d")
     prefix = MODE_PREFIX[mode]
 
@@ -464,9 +532,9 @@ def run_mode(mode: str, page_range: range, max_hours: float | None, workers: int
     # ── SAMPLE mode: no resume needed ────────────────────────────────────────
     if mode == "sample":
         log.info("=== SAMPLE MODE ===")
-        stubs = scrape_list_pages(range(1, 4))
+        sample_cfg = MODE_LIST_CONFIG["starred"]   # borrow starred URL for sample
+        stubs = scrape_list_pages(sample_cfg, range(1, 2))
         urls = [r["url"] for r in stubs if r["url"]][:5]
-        # Use a temp working CSV, then rename
         sample_working = OUTPUT_DIR / f".{prefix}_working.csv"
         sample_working.unlink(missing_ok=True)
         scrape_detail_pages(urls, sample_working, deadline, workers)
@@ -476,16 +544,16 @@ def run_mode(mode: str, page_range: range, max_hours: float | None, workers: int
         print(f"\n  {final.name}  ({sum(1 for _ in open(final)) - 1} restaurants)")
         return
 
+    cfg = MODE_LIST_CONFIG[mode]
+
     # ── Phase 1: collect URLs (skip if already saved from a prior run) ────────
     if url_list_file.exists():
         urls = url_list_file.read_text(encoding="utf-8").splitlines()
         log.info(f"=== {mode.upper()} MODE (resumed) — loaded {len(urls)} URLs from prior run ===")
     else:
-        log.info(f"=== {mode.upper()} MODE — collecting URLs ===")
-        stubs = scrape_list_pages(page_range)
-        target = DISTINCTION_SETS[mode]
-        filtered = [r for r in stubs if r.get("distinction", "") in target]
-        urls = [r["url"] for r in filtered if r.get("url")]
+        log.info(f"=== {mode.upper()} MODE — collecting URLs from {cfg['base_url']} ===")
+        stubs = scrape_list_pages(cfg, page_range)
+        urls = [r["url"] for r in stubs if r.get("url")]
         url_list_file.write_text("\n".join(urls), encoding="utf-8")
         log.info(f"Saved {len(urls)} URLs → {url_list_file}")
 
@@ -539,8 +607,10 @@ def main():
     )
     parser.add_argument(
         "--pages",
-        default="1-397",
-        help="List-page range, e.g. 1-10 for testing or 1-397 for all",
+        default=None,
+        help="List-page range override, e.g. 1-10 for testing. "
+             "Defaults to the full range for each mode "
+             "(starred: 1-80, bib: 1-76, selected: 1-397).",
     )
     parser.add_argument(
         "--max-hours",
@@ -558,11 +628,11 @@ def main():
     )
     args = parser.parse_args()
 
-    if "-" in args.pages:
-        start, end = args.pages.split("-")
+    if args.pages:
+        start, end = args.pages.split("-") if "-" in args.pages else (args.pages, args.pages)
         page_range = range(int(start), int(end) + 1)
     else:
-        page_range = range(int(args.pages), int(args.pages) + 1)
+        page_range = None  # auto-detect: stop when page returns no cards
 
     run_mode(args.mode, page_range, args.max_hours, args.workers)
     print("\nDone.")

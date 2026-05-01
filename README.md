@@ -40,9 +40,17 @@ python scraper.py --mode bib
 
 Every run goes through two phases:
 
-**Phase 1 — List pages** (~397 pages, ~48 restaurants each)
+**Phase 1 — List pages**
 
-The scraper walks through the paginated restaurant list at `guide.michelin.com/us/en/restaurants/page/N`. Each card exposes rich metadata via HTML `data-*` attributes — enough to filter by distinction tier (starred / bib / selected) and collect detail-page URLs, without needing to visit individual pages. This phase takes ~5–10 minutes.
+Each mode uses a dedicated Michelin filtered URL, so no post-filtering is needed for starred and bib:
+
+| Mode | List URL |
+|---|---|
+| `starred` | `guide.michelin.com/us/en/restaurants/all-starred` |
+| `bib` | `guide.michelin.com/us/en/restaurants/bib-gourmand` |
+| `selected` | `guide.michelin.com/us/en/restaurants` (main list, filtered to Selected only) |
+
+Each page holds ~48 restaurant cards. The scraper uses `itertools.count(1)` — an infinite page counter — and stops as soon as a page returns zero cards. This means no hardcoded page count anywhere: the scraper self-terminates correctly regardless of how many restaurants Michelin adds or removes over time. Each card exposes rich metadata via HTML `data-*` attributes — enough to collect detail-page URLs and distinction info without visiting individual pages. This phase takes ~5–10 minutes.
 
 **Phase 2 — Detail pages** (one request per restaurant)
 
@@ -60,7 +68,7 @@ The scraper visits each restaurant's individual page and extracts the full datas
 |---|---|---|
 | `--mode` | `sample` | Which tier to scrape. See modes below. |
 | `--workers` | `5` | Number of concurrent HTTP workers for detail pages. |
-| `--pages` | `1-397` | List-page range to crawl in Phase 1. Useful for testing a subset. |
+| `--pages` | _(auto)_ | Override the list-page range for Phase 1, e.g. `1-5`. By default the scraper runs until a page returns zero cards. Only needed for testing a subset. |
 | `--max-hours` | _(none)_ | Stop cleanly after N hours and preserve progress for resume. |
 
 ### `--mode`
